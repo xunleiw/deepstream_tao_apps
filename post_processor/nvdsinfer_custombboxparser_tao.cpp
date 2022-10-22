@@ -24,6 +24,9 @@
 #include <iostream>
 #include "nvdsinfer_custom_impl.h"
 #include <cassert>
+#include <cmath>
+#include <algorithm>
+#include <map>
 
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
@@ -65,6 +68,12 @@ bool NvDsInferParseCustomEfficientDetTAO (
          NvDsInferNetworkInfo  const &networkInfo,
          NvDsInferParseDetectionParams const &detectionParams,
          std::vector<NvDsInferObjectDetectionInfo> &objectList);
+
+extern "C"
+bool NvDsInferParseCustomDDETRTAO (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+                                NvDsInferNetworkInfo const &networkInfo,
+                                NvDsInferParseDetectionParams const &detectionParams,
+                                std::vector<NvDsInferObjectDetectionInfo> &objectList);
 
 extern "C"
 bool NvDsInferParseCustomNMSTLT (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
@@ -395,9 +404,105 @@ bool NvDsInferParseCustomEfficientDetTAO (std::vector<NvDsInferLayerInfo> const 
     return true;
 }
 
+extern "C"
+bool NvDsInferParseCustomDDETRTAO (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+                                NvDsInferNetworkInfo const &networkInfo,
+                                NvDsInferParseDetectionParams const &detectionParams,
+                                std::vector<NvDsInferObjectDetectionInfo> &objectList) {
+
+    // Code from NvDsInferParseCustomTfSSD for layer finding
+    auto layerFinder = [&outputLayersInfo](const std::string &name)
+        -> const NvDsInferLayerInfo *{
+        for (auto &layer : outputLayersInfo) {
+            if (layer.dataType == FLOAT &&
+              (layer.layerName && name == layer.layerName)) {
+                return &layer;
+            }
+        }
+        return nullptr;
+    };
+
+    const NvDsInferLayerInfo *boxLayer = layerFinder("pred_boxes"); // 1 x num_queries x 4
+    const NvDsInferLayerInfo *classLayer = layerFinder("pred_logits");  // 1 x num_queries x num_classes
+
+    if (!boxLayer || !classLayer) {
+        std::cerr << "ERROR: some layers missing or unsupported data types "
+                  << "in output tensors" << std::endl;
+        return false;
+    }
+
+    // #TODO: Choose topk value from pgie config file instead of hardcode
+    // topk from config cannot be accessed using detectionParams found in sources/includes/nvdsinfer_cutom_impl.h L#208
+    // const int keep_top_k = detectionParams.topk; 
+
+    const int keep_top_k = 100;
+
+    unsigned int numDetections = classLayer->inferDims.d[0];//300
+    unsigned int numClasses = classLayer->inferDims.d[1];
+    std::map<float, NvDsInferObjectDetectionInfo> ordered_objects;
+    // //DEBUG
+    // // If model does not have sigmoid layer, perform sigmoid calculation here
+    // for (unsigned int idx=0; idx < numDetections * numClasses; idx++) {
+    //     ((float*)classLayer->buffer)[idx] = 1.0/(1.0 + exp(-((float*)classLayer->buffer)[idx]));
+    // } //1x300xnum_classes 
+    // std::cout << "sigmoid(pred_logits) = ";
+    // for (unsigned int idx=0; idx < numDetections*numClasses; idx++){
+    //     std::cout << ((float*)classLayer->buffer)[idx] << ", ";
+    // }
+    // std::cout << std::endl;
+
+    // Class mapping (configs/labels_ddetr.txt)
+    // 0 - BG (To be ignored)
+    // 1 - Person
+    // 2 - Face
+    // 3 - Bag
+
+    for(unsigned int idx=0; idx< numDetections*4; idx+=4){
+        NvDsInferObjectDetectionInfo res; 
+        
+        res.classId = std::max_element(((float*)classLayer->buffer+idx), ((float*)classLayer->buffer+idx+numClasses)) - ((float*)classLayer->buffer+idx);
+        res.detectionConfidence = ((float*)classLayer->buffer)[idx+res.classId];
+        
+        // If model does not have sigmoid layer, perform sigmoid calculation here
+        res.detectionConfidence = 1.0/(1.0 + exp(-res.detectionConfidence));
+
+        if(res.classId == 0 || res.detectionConfidence < detectionParams.perClassPreclusterThreshold[res.classId]) {
+            continue;
+        }
+        enum {cx, cy, w, h};
+        float rectX1f, rectY1f, rectX2f, rectY2f;
+        
+        rectX1f = (((float*)boxLayer->buffer)[idx + cx] - (((float*)boxLayer->buffer)[idx + w]/2)) * networkInfo.width;
+        rectY1f = (((float*)boxLayer->buffer)[idx + cy] - (((float*)boxLayer->buffer)[idx + h]/2)) * networkInfo.height;
+        rectX2f = rectX1f + ((float*)boxLayer->buffer)[idx + w] * networkInfo.width;
+        rectY2f = rectY1f + ((float*)boxLayer->buffer)[idx + h] * networkInfo.height;
+        
+        rectX1f = CLIP(rectX1f, 0.0f, networkInfo.width - 1);
+        rectX2f = CLIP(rectX2f, 0.0f, networkInfo.width - 1);
+        rectY1f = CLIP(rectY1f, 0.0f, networkInfo.height - 1);
+        rectY2f = CLIP(rectY2f, 0.0f, networkInfo.height - 1);
+
+        res.left = rectX1f;
+        res.top = rectY1f;
+        res.width = rectX2f - rectX1f;
+        res.height = rectY2f - rectY1f;
+
+        ordered_objects[res.detectionConfidence] = res;
+    }
+    
+    // Use objects within top_k range 
+    int jdx=0;
+    for(std::map<float, NvDsInferObjectDetectionInfo>::iterator iter=ordered_objects.end(); iter!=ordered_objects.begin() && jdx<keep_top_k; iter--, jdx++){
+        if(iter->second.classId!=0)
+            objectList.emplace_back(iter->second);
+    }
+    return true;
+}
+
 /* Check that the custom function has been defined correctly */
 CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE(NvDsInferParseCustomNMSTLT);
 CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE(NvDsInferParseCustomBatchedYoloV5NMSTLT);
 CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE(NvDsInferParseCustomBatchedNMSTLT);
 CHECK_CUSTOM_INSTANCE_MASK_PARSE_FUNC_PROTOTYPE(NvDsInferParseCustomMrcnnTLTV2);
 CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE(NvDsInferParseCustomEfficientDetTAO);
+CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE(NvDsInferParseCustomDDETRTAO);

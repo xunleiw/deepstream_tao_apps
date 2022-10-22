@@ -129,6 +129,16 @@ wget --content-disposition https://api.ngc.nvidia.com/v2/models/nvidia/tao/bodyp
 unzip bodyposenet_deployable_v1.0.1.zip
 rm bodyposenet_deployable_v1.0.1.zip
 
+# echo "==================================================================="
+# echo "begin downloading Deformable-DETR model "
+# echo "==================================================================="
+# cd -
+# mkdir -p ./models/ddetr
+# cd ./models/ddetr
+# wget --content-disposition https://api.ngc.nvidia.com/v2/models/nvidia/tao/bodyposenet/versions/deployable_v1.0.1/zip -O bodyposenet_deployable_v1.0.1.zip
+# unzip bodyposenet_deployable_v1.0.1.zip
+# rm bodyposenet_deployable_v1.0.1.zip
+
 echo "==================================================================="
 echo "Download models successfully "
 echo "==================================================================="
